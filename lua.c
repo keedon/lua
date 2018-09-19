@@ -1,5 +1,5 @@
 /*
-** $Id: lua.c,v 1.228 2016/12/13 15:50:58 roberto Exp roberto $
+** $Id: lua.c,v 1.234 2018/03/06 20:30:17 roberto Exp roberto $
 ** Lua stand-alone interpreter
 ** See Copyright Notice in lua.h
 */
@@ -9,10 +9,11 @@
 #include "lprefix.h"
 
 
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include <signal.h>
 
 #include "lua.h"
 
@@ -20,20 +21,8 @@
 #include "lualib.h"
 
 
-#define LUA_VERSUFFIX          "_" LUA_VERSION_MAJOR "_" LUA_VERSION_MINOR
-
-
-#if !defined(LUA_PROMPT)
-#define LUA_PROMPT		"> "
-#define LUA_PROMPT2		">> "
-#endif
-
 #if !defined(LUA_PROGNAME)
 #define LUA_PROGNAME		"lua"
-#endif
-
-#if !defined(LUA_MAXINPUT)
-#define LUA_MAXINPUT		512
 #endif
 
 #if !defined(LUA_INIT_VAR)
@@ -41,65 +30,6 @@
 #endif
 
 #define LUA_INITVARVERSION	LUA_INIT_VAR LUA_VERSUFFIX
-
-
-/*
-** lua_stdin_is_tty detects whether the standard input is a 'tty' (that
-** is, whether we're running lua interactively).
-*/
-#if !defined(lua_stdin_is_tty)	/* { */
-
-#if defined(LUA_USE_POSIX)	/* { */
-
-#include <unistd.h>
-#define lua_stdin_is_tty()	isatty(0)
-
-#elif defined(LUA_USE_WINDOWS)	/* }{ */
-
-#include <io.h>
-#include <windows.h>
-
-#define lua_stdin_is_tty()	_isatty(_fileno(stdin))
-
-#else				/* }{ */
-
-/* ISO C definition */
-#define lua_stdin_is_tty()	1  /* assume stdin is a tty */
-
-#endif				/* } */
-
-#endif				/* } */
-
-
-/*
-** lua_readline defines how to show a prompt and then read a line from
-** the standard input.
-** lua_saveline defines how to "save" a read line in a "history".
-** lua_freeline defines how to free a line read by lua_readline.
-*/
-#if !defined(lua_readline)	/* { */
-
-#if defined(LUA_USE_READLINE)	/* { */
-
-#include <readline/readline.h>
-#include <readline/history.h>
-#define lua_readline(L,b,p)	((void)L, ((b)=readline(p)) != NULL)
-#define lua_saveline(L,line)	((void)L, add_history(line))
-#define lua_freeline(L,b)	((void)L, free(b))
-
-#else				/* }{ */
-
-#define lua_readline(L,b,p) \
-        ((void)L, fputs(p, stdout), fflush(stdout),  /* show prompt */ \
-        fgets(b, LUA_MAXINPUT, stdin) != NULL)  /* get line */
-#define lua_saveline(L,line)	{ (void)L; (void)line; }
-#define lua_freeline(L,b)	{ (void)L; (void)b; }
-
-#endif				/* } */
-
-#endif				/* } */
-
-
 
 
 static lua_State *globalL = NULL;
@@ -140,7 +70,7 @@ static void print_usage (const char *badoption) {
   "Available options are:\n"
   "  -e stat  execute string 'stat'\n"
   "  -i       enter interactive mode after executing 'script'\n"
-  "  -l name  require library 'name'\n"
+  "  -l name  require library 'name' into global 'name'\n"
   "  -v       show version information\n"
   "  -E       ignore environment variables\n"
   "  --       stop handling options\n"
@@ -267,6 +197,210 @@ static int dolibrary (lua_State *L, const char *name) {
     lua_setglobal(L, name);  /* global[name] = require return */
   return report(L, status);
 }
+
+
+/*
+** Push on the stack the contents of table 'arg' from 1 to #arg
+*/
+static int pushargs (lua_State *L) {
+  int i, n;
+  if (lua_getglobal(L, "arg") != LUA_TTABLE)
+    luaL_error(L, "'arg' is not a table");
+  n = (int)luaL_len(L, -1);
+  luaL_checkstack(L, n + 3, "too many arguments to script");
+  for (i = 1; i <= n; i++)
+    lua_rawgeti(L, -i, i);
+  lua_remove(L, -i);  /* remove table from the stack */
+  return n;
+}
+
+
+static int handle_script (lua_State *L, char **argv) {
+  int status;
+  const char *fname = argv[0];
+  if (strcmp(fname, "-") == 0 && strcmp(argv[-1], "--") != 0)
+    fname = NULL;  /* stdin */
+  status = luaL_loadfile(L, fname);
+  if (status == LUA_OK) {
+    int n = pushargs(L);  /* push arguments to script */
+    status = docall(L, n, LUA_MULTRET);
+  }
+  return report(L, status);
+}
+
+
+/* bits of various argument indicators in 'args' */
+#define has_error	1	/* bad option */
+#define has_i		2	/* -i */
+#define has_v		4	/* -v */
+#define has_e		8	/* -e */
+#define has_E		16	/* -E */
+
+
+/*
+** Traverses all arguments from 'argv', returning a mask with those
+** needed before running any Lua code (or an error code if it finds
+** any invalid argument). 'first' returns the first not-handled argument
+** (either the script name or a bad argument in case of error).
+*/
+static int collectargs (char **argv, int *first) {
+  int args = 0;
+  int i;
+  for (i = 1; argv[i] != NULL; i++) {
+    *first = i;
+    if (argv[i][0] != '-')  /* not an option? */
+        return args;  /* stop handling options */
+    switch (argv[i][1]) {  /* else check option */
+      case '-':  /* '--' */
+        if (argv[i][2] != '\0')  /* extra characters after '--'? */
+          return has_error;  /* invalid option */
+        *first = i + 1;
+        return args;
+      case '\0':  /* '-' */
+        return args;  /* script "name" is '-' */
+      case 'E':
+        if (argv[i][2] != '\0')  /* extra characters after 1st? */
+          return has_error;  /* invalid option */
+        args |= has_E;
+        break;
+      case 'i':
+        args |= has_i;  /* (-i implies -v) *//* FALLTHROUGH */
+      case 'v':
+        if (argv[i][2] != '\0')  /* extra characters after 1st? */
+          return has_error;  /* invalid option */
+        args |= has_v;
+        break;
+      case 'e':
+        args |= has_e;  /* FALLTHROUGH */
+      case 'l':  /* both options need an argument */
+        if (argv[i][2] == '\0') {  /* no concatenated argument? */
+          i++;  /* try next 'argv' */
+          if (argv[i] == NULL || argv[i][0] == '-')
+            return has_error;  /* no next argument or it is another option */
+        }
+        break;
+      default:  /* invalid option */
+        return has_error;
+    }
+  }
+  *first = i;  /* no script name */
+  return args;
+}
+
+
+/*
+** Processes options 'e' and 'l', which involve running Lua code.
+** Returns 0 if some code raises an error.
+*/
+static int runargs (lua_State *L, char **argv, int n) {
+  int i;
+  for (i = 1; i < n; i++) {
+    int option = argv[i][1];
+    lua_assert(argv[i][0] == '-');  /* already checked */
+    if (option == 'e' || option == 'l') {
+      int status;
+      const char *extra = argv[i] + 2;  /* both options need an argument */
+      if (*extra == '\0') extra = argv[++i];
+      lua_assert(extra != NULL);
+      status = (option == 'e')
+               ? dostring(L, extra, "=(command line)")
+               : dolibrary(L, extra);
+      if (status != LUA_OK) return 0;
+    }
+  }
+  return 1;
+}
+
+
+static int handle_luainit (lua_State *L) {
+  const char *name = "=" LUA_INITVARVERSION;
+  const char *init = getenv(name + 1);
+  if (init == NULL) {
+    name = "=" LUA_INIT_VAR;
+    init = getenv(name + 1);  /* try alternative name */
+  }
+  if (init == NULL) return LUA_OK;
+  else if (init[0] == '@')
+    return dofile(L, init+1);
+  else
+    return dostring(L, init, name);
+}
+
+
+/*
+** {==================================================================
+** Read-Eval-Print Loop (REPL)
+** ===================================================================
+*/
+
+#if !defined(LUA_PROMPT)
+#define LUA_PROMPT		"> "
+#define LUA_PROMPT2		">> "
+#endif
+
+#if !defined(LUA_MAXINPUT)
+#define LUA_MAXINPUT		512
+#endif
+
+
+/*
+** lua_stdin_is_tty detects whether the standard input is a 'tty' (that
+** is, whether we're running lua interactively).
+*/
+#if !defined(lua_stdin_is_tty)	/* { */
+
+#if defined(LUA_USE_POSIX)	/* { */
+
+#include <unistd.h>
+#define lua_stdin_is_tty()	isatty(0)
+
+#elif defined(LUA_USE_WINDOWS)	/* }{ */
+
+#include <io.h>
+#include <windows.h>
+
+#define lua_stdin_is_tty()	_isatty(_fileno(stdin))
+
+#else				/* }{ */
+
+/* ISO C definition */
+#define lua_stdin_is_tty()	1  /* assume stdin is a tty */
+
+#endif				/* } */
+
+#endif				/* } */
+
+
+/*
+** lua_readline defines how to show a prompt and then read a line from
+** the standard input.
+** lua_saveline defines how to "save" a read line in a "history".
+** lua_freeline defines how to free a line read by lua_readline.
+*/
+#if !defined(lua_readline)	/* { */
+
+#if defined(LUA_USE_READLINE)	/* { */
+
+#include <readline/readline.h>
+#include <readline/history.h>
+#define lua_initreadline(L)  \
+	((void)L, rl_readline_name="lua", rl_inhibit_completion=1)
+#define lua_readline(L,b,p)	((void)L, ((b)=readline(p)) != NULL)
+#define lua_saveline(L,line)	((void)L, add_history(line))
+#define lua_freeline(L,b)	((void)L, free(b))
+
+#else				/* }{ */
+
+#define lua_initreadline(L)  ((void)L)
+#define lua_readline(L,b,p) \
+        ((void)L, fputs(p, stdout), fflush(stdout),  /* show prompt */ \
+        fgets(b, LUA_MAXINPUT, stdin) != NULL)  /* get line */
+#define lua_saveline(L,line)	{ (void)L; (void)line; }
+#define lua_freeline(L,b)	{ (void)L; (void)b; }
+
+#endif				/* } */
+
+#endif				/* } */
 
 
 /*
@@ -408,6 +542,7 @@ static void doREPL (lua_State *L) {
   int status;
   const char *oldprogname = progname;
   progname = NULL;  /* no 'progname' on errors in interactive mode */
+  lua_initreadline(L);
   while ((status = loadline(L)) != -1) {
     if (status == LUA_OK)
       status = docall(L, 0, LUA_MULTRET);
@@ -419,216 +554,7 @@ static void doREPL (lua_State *L) {
   progname = oldprogname;
 }
 
-
-/*
-** Push on the stack the contents of table 'arg' from 1 to #arg
-*/
-static int pushargs (lua_State *L) {
-  int i, n;
-  if (lua_getglobal(L, "arg") != LUA_TTABLE)
-    luaL_error(L, "'arg' is not a table");
-  n = (int)luaL_len(L, -1);
-  luaL_checkstack(L, n + 3, "too many arguments to script");
-  for (i = 1; i <= n; i++)
-    lua_rawgeti(L, -i, i);
-  lua_remove(L, -i);  /* remove table from the stack */
-  return n;
-}
-
-
-static int handle_script (lua_State *L, char **argv) {
-  int status;
-  const char *fname = argv[0];
-  if (strcmp(fname, "-") == 0 && strcmp(argv[-1], "--") != 0)
-    fname = NULL;  /* stdin */
-  status = luaL_loadfile(L, fname);
-  if (status == LUA_OK) {
-    int n = pushargs(L);  /* push arguments to script */
-    status = docall(L, n, LUA_MULTRET);
-  }
-  return report(L, status);
-}
-
-
-
-/* bits of various argument indicators in 'args' */
-#define has_error	1	/* bad option */
-#define has_i		2	/* -i */
-#define has_v		4	/* -v */
-#define has_e		8	/* -e */
-#define has_E		16	/* -E */
-
-/*
-** Traverses all arguments from 'argv', returning a mask with those
-** needed before running any Lua code (or an error code if it finds
-** any invalid argument). 'first' returns the first not-handled argument
-** (either the script name or a bad argument in case of error).
-*/
-static int collectargs (char **argv, int *first) {
-  int args = 0;
-  int i;
-  for (i = 1; argv[i] != NULL; i++) {
-    *first = i;
-    if (argv[i][0] != '-')  /* not an option? */
-        return args;  /* stop handling options */
-    switch (argv[i][1]) {  /* else check option */
-      case '-':  /* '--' */
-        if (argv[i][2] != '\0')  /* extra characters after '--'? */
-          return has_error;  /* invalid option */
-        *first = i + 1;
-        return args;
-      case '\0':  /* '-' */
-        return args;  /* script "name" is '-' */
-      case 'E':
-        if (argv[i][2] != '\0')  /* extra characters after 1st? */
-          return has_error;  /* invalid option */
-        args |= has_E;
-        break;
-      case 'i':
-        args |= has_i;  /* (-i implies -v) *//* FALLTHROUGH */
-      case 'v':
-        if (argv[i][2] != '\0')  /* extra characters after 1st? */
-          return has_error;  /* invalid option */
-        args |= has_v;
-        break;
-      case 'e':
-        args |= has_e;  /* FALLTHROUGH */
-      case 'l':  /* both options need an argument */
-        if (argv[i][2] == '\0') {  /* no concatenated argument? */
-          i++;  /* try next 'argv' */
-          if (argv[i] == NULL || argv[i][0] == '-')
-            return has_error;  /* no next argument or it is another option */
-        }
-        break;
-      default:  /* invalid option */
-        return has_error;
-    }
-  }
-  *first = i;  /* no script name */
-  return args;
-}
-
-
-/*
-** Processes options 'e' and 'l', which involve running Lua code.
-** Returns 0 if some code raises an error.
-*/
-static int runargs (lua_State *L, char **argv, int n) {
-  int i;
-  for (i = 1; i < n; i++) {
-    int option = argv[i][1];
-    lua_assert(argv[i][0] == '-');  /* already checked */
-    if (option == 'e' || option == 'l') {
-      int status;
-      const char *extra = argv[i] + 2;  /* both options need an argument */
-      if (*extra == '\0') extra = argv[++i];
-      lua_assert(extra != NULL);
-      status = (option == 'e')
-               ? dostring(L, extra, "=(command line)")
-               : dolibrary(L, extra);
-      if (status != LUA_OK) return 0;
-    }
-  }
-  return 1;
-}
-
-
-
-/*
-** {==================================================================
-** Set Paths
-** ===================================================================
-*/
-
-/*
-** LUA_PATH_VAR and LUA_CPATH_VAR are the names of the environment
-** variables that Lua check to set its paths.
-*/
-#if !defined(LUA_PATH_VAR)
-#define LUA_PATH_VAR    "LUA_PATH"
-#endif
-
-#if !defined(LUA_CPATH_VAR)
-#define LUA_CPATH_VAR   "LUA_CPATH"
-#endif
-
-#define LUA_PATHVARVERSION              LUA_PATH_VAR LUA_VERSUFFIX
-#define LUA_CPATHVARVERSION             LUA_CPATH_VAR LUA_VERSUFFIX
-
-
-#define AUXMARK         "\1"	/* auxiliary mark */
-
-
-#if defined(LUA_USE_WINDOWS)
-
-
-/*
-** Replace in the path (on the top of the stack) any occurrence
-** of LUA_EXEC_DIR with the executable's path.
-*/
-static void setprogdir (lua_State *L) {
-  char buff[MAX_PATH + 1];
-  char *lb;
-  DWORD nsize = sizeof(buff)/sizeof(char);
-  DWORD n = GetModuleFileNameA(NULL, buff, nsize);  /* get exec. name */
-  if (n == 0 || n == nsize || (lb = strrchr(buff, '\\')) == NULL)
-    luaL_error(L, "unable to get ModuleFileName");
-  else {
-    *lb = '\0';  /* cut name on the last '\\' to get the path */
-    luaL_gsub(L, lua_tostring(L, -1), LUA_EXEC_DIR, buff);
-    lua_remove(L, -2);  /* remove original string */
-  }
-}
-
-#else
-
-#define setprogdir(L)           ((void)0)
-
-#endif
-
-/*
-** Change a path according to corresponding environment variables
-*/
-static void chgpath (lua_State *L, const char *fieldname,
-                                   const char *envname1,
-                                   const char *envname2,
-                                   int noenv) {
-  const char *path = getenv(envname1);
-  lua_getglobal(L, LUA_LOADLIBNAME);  /* get 'package' table */
-  lua_getfield(L, -1, fieldname);  /* get original path */
-  if (path == NULL)  /* no environment variable? */
-    path = getenv(envname2);  /* try alternative name */
-  if (path == NULL || noenv)  /* no environment variable? */
-    lua_pushvalue(L, -1);  /* use original value */
-  else {
-    const char *def = lua_tostring(L, -1);  /* default path */
-    /* replace ";;" by ";AUXMARK;" and then AUXMARK by default path */
-    path = luaL_gsub(L, path, LUA_PATH_SEP LUA_PATH_SEP,
-                              LUA_PATH_SEP AUXMARK LUA_PATH_SEP);
-    luaL_gsub(L, path, AUXMARK, def);
-    lua_remove(L, -2); /* remove result from 1st 'gsub' */
-  }
-  setprogdir(L);
-  lua_setfield(L, -3, fieldname);  /* set path value */
-  lua_pop(L, 2);  /* pop 'package' table and original path  */
-}
-
 /* }================================================================== */
-
-
-static int handle_luainit (lua_State *L) {
-  const char *name = "=" LUA_INITVARVERSION;
-  const char *init = getenv(name + 1);
-  if (init == NULL) {
-    name = "=" LUA_INIT_VAR;
-    init = getenv(name + 1);  /* try alternative name */
-  }
-  if (init == NULL) return LUA_OK;
-  else if (init[0] == '@')
-    return dofile(L, init+1);
-  else
-    return dostring(L, init, name);
-}
 
 
 /*
@@ -648,11 +574,13 @@ static int pmain (lua_State *L) {
   }
   if (args & has_v)  /* option '-v'? */
     print_version();
+  if (args & has_E) {  /* option '-E'? */
+    lua_pushboolean(L, 1);  /* signal for libraries to ignore env. vars. */
+    lua_setfield(L, LUA_REGISTRYINDEX, "LUA_NOENV");
+  }
   luaL_openlibs(L);  /* open standard libraries */
-  /* change paths according to env variables */
-  chgpath(L, "path", LUA_PATHVARVERSION, LUA_PATH_VAR, (args & has_E));
-  chgpath(L, "cpath", LUA_CPATHVARVERSION, LUA_CPATH_VAR, (args & has_E));
   createargtable(L, argv, argc, script);  /* create table 'arg' */
+  lua_gc(L, LUA_GCGEN, 0, 0);  /* GC in generational mode */
   if (!(args & has_E)) {  /* no option '-E'? */
     if (handle_luainit(L) != LUA_OK)  /* run LUA_INIT */
       return 0;  /* error running LUA_INIT */
